@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UP_VERSION="0.2.0"
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  up [pattern]
+  up completion <zsh|bash>
+  up --help
+  up --version
+
+Behavior:
+  - With no pattern, prints the parent directory.
+  - With a pattern, finds matching ancestor directories (case-insensitive fuzzy match).
+  - If exactly one match exists, prints that path.
+  - If no match exists, exits with code 2.
+  - If multiple matches exist, it can launch fzf (if installed and interactive).
+  - Otherwise it prints candidates to stderr and exits with code 3.
+
+Examples:
+  cd "$(up dev)"
+  eval "$(up completion zsh)"
+EOF
+}
+
+to_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+fuzzy_score() {
+  local name_lc="$1"
+  local query_lc="$2"
+
+  if [[ -z "$query_lc" ]]; then
+    printf '1000\n'
+    return 0
+  fi
+
+  if [[ "$name_lc" == "$query_lc" ]]; then
+    printf '0\n'
+    return 0
+  fi
+
+  if [[ "$name_lc" == "$query_lc"* ]]; then
+    printf '10\n'
+    return 0
+  fi
+
+  if [[ "$name_lc" == *"$query_lc"* ]]; then
+    local prefix="${name_lc%%"$query_lc"*}"
+    printf '%s\n' "$((50 + ${#prefix}))"
+    return 0
+  fi
+
+  # Subsequence fuzzy match with smaller gap preferred.
+  local nlen qlen i j prev gap_sum
+  nlen=${#name_lc}
+  qlen=${#query_lc}
+  i=0
+  j=0
+  prev=-1
+  gap_sum=0
+
+  while (( i < qlen )); do
+    local qc found
+    qc="${query_lc:i:1}"
+    found=0
+    while (( j < nlen )); do
+      local nc
+      nc="${name_lc:j:1}"
+      if [[ "$nc" == "$qc" ]]; then
+        if (( prev >= 0 )); then
+          gap_sum=$((gap_sum + j - prev - 1))
+        fi
+        prev=$j
+        j=$((j + 1))
+        found=1
+        break
+      fi
+      j=$((j + 1))
+    done
+    if (( found == 0 )); then
+      return 1
+    fi
+    i=$((i + 1))
+  done
+
+  printf '%s\n' "$((120 + gap_sum + (nlen - qlen)))"
+  return 0
+}
+
+parent_dir() {
+  local path="$1"
+  if [[ "$path" == "/" ]]; then
+    printf '/\n'
+    return 0
+  fi
+
+  path="${path%/}"
+  local parent="${path%/*}"
+  if [[ -z "$parent" ]]; then
+    parent="/"
+  fi
+
+  printf '%s\n' "$parent"
+}
+
+iter_ancestors() {
+  local path="$1"
+  path="${path%/}"
+  if [[ -z "$path" ]]; then
+    path="/"
+  fi
+
+  while true; do
+    printf '%s\n' "$path"
+    if [[ "$path" == "/" ]]; then
+      break
+    fi
+    path="${path%/*}"
+    if [[ -z "$path" ]]; then
+      path="/"
+    fi
+  done
+}
+
+base_name() {
+  local path="$1"
+  if [[ "$path" == "/" ]]; then
+    printf '/\n'
+  else
+    printf '%s\n' "${path##*/}"
+  fi
+}
+
+collect_matches() {
+  local cwd="$1"
+  local query="$2"
+  local include_current="$3"
+  local query_lc
+  query_lc="$(to_lower "$query")"
+
+  local first=1
+  local idx=0
+  while IFS= read -r ancestor; do
+    if [[ "$include_current" -eq 0 && "$first" -eq 1 ]]; then
+      first=0
+      idx=$((idx + 1))
+      continue
+    fi
+    first=0
+
+    local name score
+    local name_lc
+    name="$(base_name "$ancestor")"
+    name_lc="$(to_lower "$name")"
+
+    if score="$(fuzzy_score "$name_lc" "$query_lc")"; then
+      printf '%s\t%s\t%s\t%s\n' "$score" "$idx" "$name" "$ancestor"
+    fi
+
+    idx=$((idx + 1))
+  done < <(iter_ancestors "$cwd")
+}
+
+sorted_matches() {
+  local cwd="$1"
+  local pattern="$2"
+  collect_matches "$cwd" "$pattern" 0 | LC_ALL=C sort -t $'\t' -k1,1n -k2,2n
+}
+
+print_ambiguous_matches() {
+  local pattern="$1"
+  shift || true
+  local matches=("$@")
+
+  printf "up: multiple ancestors match '%s':\n" "$pattern" >&2
+  local idx=1
+  local entry score order name path
+  for entry in "${matches[@]}"; do
+    IFS=$'\t' read -r score order name path <<<"$entry"
+    printf '  %d. %s\n' "$idx" "$path" >&2
+    idx=$((idx + 1))
+  done
+}
+
+select_with_fzf() {
+  local matches=("$@")
+
+  if [[ ! -t 1 ]]; then
+    return 1
+  fi
+  if ! command -v fzf >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ "${UP_NO_FZF:-0}" == "1" ]]; then
+    return 1
+  fi
+
+  local input=""
+  local entry score order name path
+  for entry in "${matches[@]}"; do
+    IFS=$'\t' read -r score order name path <<<"$entry"
+    input+="$path"$'\t'"$name"$'\n'
+  done
+
+  local selected path_selected
+  selected="$(
+    printf '%s' "$input" | \
+      fzf --delimiter=$'\t' --with-nth=2,1 --prompt='up> ' --height=40% --reverse --no-sort --tiebreak=index
+  )" || return 130
+
+  if [[ -z "$selected" ]]; then
+    return 130
+  fi
+
+  path_selected="${selected%%$'\t'*}"
+  printf '%s\n' "$path_selected"
+  return 0
+}
+
+resolve_target() {
+  local cwd="$1"
+  local pattern="${2-}"
+
+  if [[ -z "$pattern" ]]; then
+    parent_dir "$cwd"
+    return 0
+  fi
+
+  local matches=()
+  local line
+  while IFS= read -r line; do
+    matches+=("$line")
+  done < <(sorted_matches "$cwd" "$pattern")
+
+  if [[ "${#matches[@]}" -eq 0 ]]; then
+    printf "up: no ancestor matches '%s'\n" "$pattern" >&2
+    return 2
+  fi
+
+  if [[ "${#matches[@]}" -gt 1 ]]; then
+    local selected
+    if selected="$(select_with_fzf "${matches[@]}")"; then
+      printf '%s\n' "$selected"
+      return 0
+    fi
+
+    local fzf_status=$?
+    if [[ "$fzf_status" -eq 130 ]]; then
+      printf 'up: selection canceled\n' >&2
+      return 130
+    fi
+
+    print_ambiguous_matches "$pattern" "${matches[@]}"
+    return 3
+  fi
+
+  local score order name path
+  IFS=$'\t' read -r score order name path <<<"${matches[0]}"
+  printf '%s\n' "$path"
+}
+
+print_zsh_completion() {
+  cat <<'EOF'
+up() {
+  if (( $# == 0 )); then
+    builtin cd ..
+    return $?
+  fi
+
+  local dest
+  dest="$(command up __query "$1")" || return $?
+  builtin cd -- "$dest"
+}
+
+_up_completion() {
+  local -a lines names descriptions
+  local current_word="${words[CURRENT]}"
+  lines=("${(@f)$(command up __complete "$current_word")}")
+
+  local line name path
+  for line in "${lines[@]}"; do
+    name="${line%%$'\t'*}"
+    path="${line#*$'\t'}"
+    names+=("$name")
+    descriptions+=("$path")
+  done
+
+  compadd -Q -d descriptions -- "${names[@]}"
+}
+
+compdef _up_completion up
+EOF
+}
+
+print_bash_completion() {
+  cat <<'EOF'
+up() {
+  if [[ "$#" -eq 0 ]]; then
+    builtin cd ..
+    return $?
+  fi
+
+  local dest
+  dest="$(command up __query "$1")" || return $?
+  builtin cd -- "$dest"
+}
+
+_up_completion() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local IFS=$'\n'
+  local lines=($(command up __complete "$cur"))
+  COMPREPLY=()
+
+  local line
+  local name
+  for line in "${lines[@]}"; do
+    name="${line%%$'\t'*}"
+    COMPREPLY+=("$name")
+  done
+}
+
+complete -F _up_completion up
+EOF
+}
+
+main() {
+  local cwd
+  cwd="$(pwd -P)"
+
+  case "${1-}" in
+    -h|--help)
+      print_help
+      ;;
+    -V|--version)
+      printf '%s\n' "$UP_VERSION"
+      ;;
+    completion)
+      local shell="${2-}"
+      case "$shell" in
+        zsh) print_zsh_completion ;;
+        bash) print_bash_completion ;;
+        *)
+          printf "up: unsupported shell '%s' (expected: zsh or bash)\n" "$shell" >&2
+          return 1
+          ;;
+      esac
+      ;;
+    __query)
+      shift || true
+      resolve_target "$cwd" "${1-}"
+      ;;
+    __complete)
+      shift || true
+      local q="${1-}"
+      local line score order name path
+      while IFS= read -r line; do
+        IFS=$'\t' read -r score order name path <<<"$line"
+        printf '%s\t%s\n' "$name" "$path"
+      done < <(sorted_matches "$cwd" "$q")
+      ;;
+    *)
+      if [[ "$#" -gt 1 ]]; then
+        printf 'up: expected zero or one positional argument\n' >&2
+        return 1
+      fi
+      resolve_target "$cwd" "${1-}"
+      ;;
+  esac
+}
+
+main "$@"
