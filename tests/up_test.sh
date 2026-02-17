@@ -133,6 +133,14 @@ test_completion_command() {
   local output
   output="$("$UP_BIN" completion zsh)"
   assert_contains "zsh completion prints function" "$output" "compdef _up_completion up"
+  assert_contains "zsh completion forwards help/version to binary" "$output" "-h|--help|-V|--version|completion|__query|__complete)"
+}
+
+test_bash_completion_command() {
+  local output
+  output="$("$UP_BIN" completion bash)"
+  assert_contains "bash completion prints function" "$output" "complete -F _up_completion up"
+  assert_contains "bash completion forwards help/version to binary" "$output" "-h|--help|-V|--version|completion|__query|__complete)"
 }
 
 test_internal_complete() {
@@ -151,6 +159,7 @@ test_fuzzy_subsequence_match
 test_no_match
 test_ambiguous_match
 test_completion_command
+test_bash_completion_command
 test_internal_complete
 
 printf '\nSummary: %d passed, %d failed\n' "$pass_count" "$fail_count"

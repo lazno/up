@@ -271,6 +271,18 @@ up() {
     return $?
   fi
 
+  case "$1" in
+    -h|--help|-V|--version|completion|__query|__complete)
+      command up "$@"
+      return $?
+      ;;
+  esac
+
+  if (( $# > 1 )); then
+    command up "$@"
+    return $?
+  fi
+
   local dest
   dest="$(command up __query "$1")" || return $?
   builtin cd -- "$dest"
@@ -301,6 +313,18 @@ print_bash_completion() {
 up() {
   if [[ "$#" -eq 0 ]]; then
     builtin cd ..
+    return $?
+  fi
+
+  case "$1" in
+    -h|--help|-V|--version|completion|__query|__complete)
+      command up "$@"
+      return $?
+      ;;
+  esac
+
+  if [[ "$#" -gt 1 ]]; then
+    command up "$@"
     return $?
   fi
 
